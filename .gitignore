@@ -1,0 +1,13 @@
+/lib/
+/classes/
+/target/
+/checkouts/
+.lein-deps-sum
+.lein-repl-history
+.lein-plugins/
+.lein-failures
+.lein-env
+.nrepl-port
+.nrepl-history
+.cpcache
+.clj-kondo/.cache/
