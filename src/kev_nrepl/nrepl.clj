@@ -1,9 +1,13 @@
 (ns kev-nrepl.nrepl
   (:require [babashka.fs :as fs]
-            [clj-kondo.core :as clj-kondo]
+            [clojure.core.async :as async]
             [clojure.edn :as edn]
-            [clojure.java.classpath :as cp]
+            [clojure.tools.deps.alpha.repl :as deps.repl]
             [clojure.tools.namespace.find]
+            [clojure.tools.namespace.dir :as n.dir]
+            [clojure.tools.namespace.track :as n.track]
+            [juxt.dirwatch :as dirwatch]
+            [kev-nrepl.var-index :as index]
             [nrepl.middleware :as middleware]
             [nrepl.transport :as transport]
             [nrepl.misc :refer [response-for]]
@@ -11,11 +15,33 @@
 
 ;;most adapted from https://github.com/clj-kondo/clj-kondo/blob/master/analysis/src/clj_kondo/tools/find_var.clj
 
-(defn get-paths []
-  (filter fs/relative? (cp/system-classpath)))
+(defn make-updater!
+  "expects `f` to return an async channel but only to indicate it's completion.
+  This is used for side effects. returns a channel and calls `f` with
+  the latest thing passed to that channel. at most one invocation of `f`
+  happening at any given time."
+  [f]
+  (let [c (async/chan)]
+    (async/go-loop [f-chan nil
+                    input nil]
+      (if (and f-chan (async/poll! f-chan))
+        (if input
+          (recur (f input) nil)
+          (recur nil nil))
+        (recur f-chan (async/<! c))))
+    c))
 
-(defn get-kondo [] (clj-kondo/run! {:config {:output {:analysis true}}
-                                    :lint (get-paths)}))
+(defonce global-index
+  (let [index (atom nil)
+        kondo-update-chan (make-updater! (fn []
+                                           (tap> "updating var index!")
+                                           (reset! index (index/kondo->index (index/get-kondo)))
+                                           (tap> "updated!")))]
+    (async/go (async/>! kondo-update-chan "start!"))
+    (apply dirwatch/watch-dir (cons (fn [& args]
+                                      (async/go (async/>! kondo-update-chan args)))
+                                    (index/get-paths)))
+    index))
 
 (defn root-relative-path [absolute-path]
   (str (fs/relativize (fs/absolutize (fs/path ".")) absolute-path)))
@@ -24,7 +50,7 @@
   "looks up code point in the analysis var database to see if it's on a variable
   usage or def and returns it if so"
   [file line col]
-  (let [analysis (:analysis (get-kondo))]
+  (let [analysis (:analysis (index/get-kondo))]
     (letfn [(var-matches [{:keys [filename name-col name-row name-end-col] :as match}]
               (and (= file filename)
                    (= name-row line)
@@ -50,7 +76,7 @@
 ;; https://stackoverflow.com/questions/15720822/how-to-get-names-of-classes-inside-a-jar-file
 ;; for clojure sources though, tools.namespace should be fine
 ;;  - see if you can just add this to :lint when passing to analysis
-(def actions {:find-var (fn [[file line col]]
+(def actions {:find-var-old (fn [[file line col]]
                           (tap> {:point->var (point->var (root-relative-path file) line col)})
                           (let [{find-ns :ns find-to :to find-name :name} (point->var (root-relative-path file) line col)]
                             (if find-ns ;; then its a def, find usages
@@ -68,6 +94,14 @@
                                                       (when (and (= find-name name)
                                                                  (= find-to ns))
                                                         (str filename ":" row ":" col)))))}))))
+              :find-var (fn [[file line col]]
+                          (let [var (index/point->var @global-index [(root-relative-path file) line col])]
+                            (tap> {::found-var var})
+                            (if (= ::index/var-defn (::index/var-type)) ;; it's def, return usages
+                              (map index/var->loc (some-> @global-index ::index/vars
+                                                          (get (::index/fullname var)) ::index/var-usages))
+                              (map index/var->loc (some-> @global-index ::index/vars
+                                                          (get (::index/fullname var)) ::index/var-defns)))))
               :nothing #(str "nothing-" %)})
 
 (defn kevin-handler [{t :transport :as msg}]
