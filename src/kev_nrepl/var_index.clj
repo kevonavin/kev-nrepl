@@ -26,13 +26,15 @@
                    :var-definitions       ::var-defn
                    :var-usages            ::var-usage})
 
-(defn kondo->index [kondo]
+(defn kondo->index
+  "converts clj-kondo analysis into a more efficient data structure for lookups"
+  [kondo]
   (->> kondo :analysis
        (filter #(contains? category-map (first %)))
        (mapcat
         (fn [[category varlist]]
           (mapcat
-           (fn [{:keys [to ns name name-row filename name-col name-end-col] :as var}]
+           (fn [{:keys [to ns name name-row filename name-col name-end-col]}]
              (let [fullname (if (or to ns) (symbol (str (or to ns)) (str name)) name)
                    var-type (category-map category)
                    var-dict {::var-type var-type
@@ -64,8 +66,10 @@
   (def kondo (get-kondo))
 
   (def index (kondo->index kondo))
+
   (point->var index ["src/ekata/lis/cass.clj" 34 10])
 
+  ;; lookup a var in the ::vars index
   (-> index ::vars
       (get (::fullname (point->var index ["src/ekata/lis/cass.clj" 34 10]))))
 
